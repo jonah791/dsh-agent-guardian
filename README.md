@@ -1,5 +1,11 @@
 # dsh-agent-guardian
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-guardian"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 > 守卫插件：web 保活——拉起 / 崩溃自愈 / 收养外部 dsh web。
 > DeepSeek Harness 自研插件 · v0.1.1（从 dsh-agent-watch 拆分）
 
