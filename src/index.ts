@@ -101,6 +101,20 @@ export interface WebmanService {
   waitPortFree(maxWaitMs?: number): Promise<boolean>
 }
 
+/**
+ * 唤醒服务的最小结构类型（dsh-agent-sentinel 提供 `ctx.sessionWaker`）。
+ * 用结构类型而非 import sentinel 的接口：守护四件套之间不引入编译期耦合，
+ * 且 guardian 用 `ctx.get` 可选消费（sentinel 缺席时保活照常，只是不唤醒）。
+ */
+export interface SessionWakerLite {
+  wakeLatestSession(text: string, opts?: { explicitId?: string; waitWebReadyMs?: number }): Promise<{
+    ok: boolean
+    sessionId?: string
+    reason: string
+    candidates: string[]
+  }>
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     preflight: PreflightService
@@ -313,6 +327,35 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * 拉起 web 成功后通知最近活跃会话（2026-09-10 回归修复）。
+   *
+   * 事故：主人实测「重启后没收到提醒」。根因——旧 `dsh-agent-watch` 的自动拉起路径
+   * 有唤醒（其源码注释：2026-08-25「自动拉起路径补齐唤醒——此前仅哨兵周期发唤醒」），
+   * 但 2026-08-27 拆成 runtime/preflight/sentinel/guardian 四件套时**该能力未迁移**，
+   * 于是「哨兵周期重启」有提醒、「保活自愈拉起」无提醒。
+   *
+   * 实现：复用 sentinel 提供的 `ctx.sessionWaker`（同一份唤醒实现，杜绝再次漂移）。
+   * 用 `ctx.get` 取可选服务——**不能加进 inject**：inject 是 cordis 的激活门，
+   * sentinel 缺席时若被 gate 住，保活本身也停了（本末倒置）。
+   */
+  const notifyWebReady = async (): Promise<void> => {
+    try {
+      const getter = (ctx as unknown as { get?: (name: string) => unknown }).get
+      const waker = typeof getter === 'function' ? getter.call(ctx, 'sessionWaker') as SessionWakerLite | undefined : undefined
+      if (waker === undefined || typeof waker.wakeLatestSession !== 'function') {
+        logEvent('web 已拉起，但 sessionWaker 服务不可用（sentinel 未挂载？）——跳过唤醒')
+        return
+      }
+      const r = await waker.wakeLatestSession('[守护] web 已拉起（保活/自愈）。请继续。')
+      logEvent(r.ok
+        ? '拉起后唤醒已发送: ' + String(r.sessionId)
+        : '拉起后唤醒未发送: ' + r.reason + '（候选=[' + r.candidates.join(',') + ']）')
+    } catch (e) {
+      logEvent('拉起后唤醒异常（已吞，不影响保活）: ' + String(e))
+    }
+  }
+
+  /**
    * 拉起 web（统一入口）。【preflight gate】：每次拉起前调 ctx.preflight.run(quick)
    * ——快速静态+磁盘+会话日志检查，预检不过不拉起（fail-closed，主人 2026-08-26）。
    */
@@ -370,6 +413,9 @@ export function apply(ctx: Context, config: Config): void {
         })
         state.child = spawned
         resolvePromise()
+        // 2026-09-10 回归修复：保活/自愈拉起也要唤醒（原先仅哨兵周期有唤醒）。
+        // 不阻塞拉起流程——唤醒内部自行等待 web 就绪，失败也不影响保活。
+        if (spawned !== null) void notifyWebReady()
       })()
     })
 
