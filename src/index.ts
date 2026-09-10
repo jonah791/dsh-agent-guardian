@@ -156,10 +156,27 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  /**
+   * 发 telegram 告警（**带存活证据**，2026-09-10 修复）。
+   *
+   * 原实现的三个静默缺口（违反 5.12 §3「提醒类机制要有存活证据」与 5.13 §2「不许静默放弃」）：
+   *   ① `if (!token || !chat) return` —— 未配置时静默放弃，事后无从发现告警通道是断的
+   *   ② `child.on('error', () => {})` —— spawn 失败（curl 缺失等）被吞
+   *   ③ `catch {}` + 不等子进程 —— 异常、curl 非 0 退出、Telegram API 拒绝全部无声
+   * 后果实测：2026-09-08 熔断告警是否送达**从日志无法回答**（只在 logger，而 watch stdout 常不可见）。
+   * 修法：全程落盘（发起/送达/失败+原因），并以 **curl 退出码 + 响应 ok 字段**双重判据定成功——
+   * 只加证据链，不改变告警行为。
+   * @param text - 告警正文
+   */
   const sendTelegram = async (text: string): Promise<void> => {
     const token = config.telegramBotToken
     const chat = config.telegramChatId
-    if (!token || !chat) return
+    if (!token || !chat) {
+      logEvent('telegram 告警未发送：未配置 telegramBotToken/telegramChatId（告警通道不可用）')
+      return
+    }
+    const hint = text.slice(0, 60).replace(/\s+/g, ' ')
+    logEvent('telegram 告警发送中: ' + hint)
     const body = JSON.stringify({ chat_id: Number(chat), text, disable_notification: false })
     try {
       const child = spawn('curl.exe', [
@@ -167,8 +184,20 @@ export function apply(ctx: Context, config: Config): void {
         '-H', 'Content-Type: application/json', '-d', body,
         'https://api.telegram.org/bot' + token + '/sendMessage',
       ], { windowsHide: true })
-      child.on('error', () => { /* 忽略 */ })
-    } catch { /* 忽略 */ }
+      let out = ''
+      child.stdout?.on('data', (d: Buffer) => { out += d.toString('utf8') })
+      child.on('error', (e) => { logEvent('telegram 告警失败（spawn 失败）: ' + String(e) + ' — ' + hint) })
+      child.on('close', (code) => {
+        // 双重判据：curl 退出码 + Telegram 响应体 ok 字段（减少告警 storm 的同时保证准确）
+        let apiOk = false
+        try { apiOk = JSON.parse(out).ok === true } catch { apiOk = false }
+        const ok = code === 0 && apiOk
+        logEvent('telegram 告警' + (ok ? '已送达' : '失败') + '（curl exit=' + String(code)
+          + (ok ? '' : '，响应=' + out.slice(0, 150)) + '） — ' + hint)
+      })
+    } catch (e) {
+      logEvent('telegram 告警异常: ' + String(e) + ' — ' + hint)
+    }
   }
 
   // ── 数据健康检查 + 存档点自动恢复（主人 2026-08-28：恢复与守卫联动）──
