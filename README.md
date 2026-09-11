@@ -47,6 +47,16 @@ cd self-plugins/dsh-agent-guardian && pnpm install && pnpm build
 - **零互踢**：收养外部 web 而非杀掉重启，避免多人/多进程操作同一端口冲突
 - 三插件分工（guardian / sentinel / preflight）消除了原 dsh-agent-watch 的单体耦合
 
+## 告警传输（2026-09-11 修正）
+
+Telegram 告警走 `src/alert-transport.ts`：**主通道** spawn node 子进程（注入 `NODE_USE_ENV_PROXY=1`）执行内置 `fetch`，**兜底通道** `curl.exe -x <proxy>`；两条通道的结论都落盘（发送中／送达通道／失败原因），不再有静默分支。
+
+修正原因（本机实测）：`curl.exe` 是 Schannel 版（8.21.0），经 clash 代理时 CONNECT 隧道建立成功（`HTTP/1.1 200 Connection established`）但随后的 TLS 握手一律失败 —— `curl -s -x http://127.0.0.1:16888 https://api.telegram.org` 返回 **exit 35**，`-k`／`--http1.1`／`--tlsv1.2` 各变体同样 35；同一代理、同一时刻 Node `fetch`（OpenSSL）成功（`getMe` ok=true 1.3s，`sendMessage` 实测送达）。即 curl 通道在本环境**结构性不可用**，而它承载的正是「崩溃循环熔断」这类只能靠外部告警告知主人的防线。
+
+为什么不在守护进程内直接 fetch：Node 的 `EnvHttpProxyAgent` 只在**进程启动时**读取 `NODE_USE_ENV_PROXY`（实测进程内设置该变量后 fetch 仍不走代理、12s 超时），而该 flag 只被注入 web 子进程 —— 故用子进程承载。
+
+判据（`judgeTelegramResponse`，离线单测含尸体样本）：**退出码 0 且响应体 `ok === true`** 才算送达；实测存在「exit 0 但 API ok=false」的形态，单看退出码会误报。
+
 ## License
 
 MIT

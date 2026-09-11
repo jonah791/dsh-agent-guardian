@@ -14,6 +14,7 @@ import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs'
 import { readdir, readFile, copyFile, mkdir, rm, rename } from 'node:fs/promises'
 import { join, dirname, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
+import { sendTelegramAlert } from './alert-transport.ts'
 import { createHash } from 'node:crypto'
 import net from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
@@ -169,35 +170,18 @@ export function apply(ctx: Context, config: Config): void {
    * @param text - 告警正文
    */
   const sendTelegram = async (text: string): Promise<void> => {
-    const token = config.telegramBotToken
-    const chat = config.telegramChatId
-    if (!token || !chat) {
-      logEvent('telegram 告警未发送：未配置 telegramBotToken/telegramChatId（告警通道不可用）')
-      return
-    }
     const hint = text.slice(0, 60).replace(/\s+/g, ' ')
     logEvent('telegram 告警发送中: ' + hint)
-    const body = JSON.stringify({ chat_id: Number(chat), text, disable_notification: false })
-    try {
-      const child = spawn('curl.exe', [
-        '-s', '--max-time', '15', '-x', config.httpProxy || 'http://127.0.0.1:16888',
-        '-H', 'Content-Type: application/json', '-d', body,
-        'https://api.telegram.org/bot' + token + '/sendMessage',
-      ], { windowsHide: true })
-      let out = ''
-      child.stdout?.on('data', (d: Buffer) => { out += d.toString('utf8') })
-      child.on('error', (e) => { logEvent('telegram 告警失败（spawn 失败）: ' + String(e) + ' — ' + hint) })
-      child.on('close', (code) => {
-        // 双重判据：curl 退出码 + Telegram 响应体 ok 字段（减少告警 storm 的同时保证准确）
-        let apiOk = false
-        try { apiOk = JSON.parse(out).ok === true } catch { apiOk = false }
-        const ok = code === 0 && apiOk
-        logEvent('telegram 告警' + (ok ? '已送达' : '失败') + '（curl exit=' + String(code)
-          + (ok ? '' : '，响应=' + out.slice(0, 150)) + '） — ' + hint)
-      })
-    } catch (e) {
-      logEvent('telegram 告警异常: ' + String(e) + ' — ' + hint)
-    }
+    // 2026-09-11：传输层交给 alert-transport（curl/schannel 经代理 TLS 必失败，实测 exit 35），
+    // 主通道 node-fetch、curl 兜底，结论落盘（含所用通道）。
+    const r = await sendTelegramAlert({
+      token: config.telegramBotToken,
+      chatId: config.telegramChatId,
+      text,
+      proxy: config.httpProxy || 'http://127.0.0.1:16888',
+    })
+    logEvent('telegram 告警' + (r.ok ? '已送达（' + r.channel + '）' : '失败（' + r.channel + '）：' + r.detail)
+      + ' — ' + hint)
   }
 
   // ── 数据健康检查 + 存档点自动恢复（主人 2026-08-28：恢复与守卫联动）──
