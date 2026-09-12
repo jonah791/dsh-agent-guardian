@@ -15,6 +15,7 @@ import { readdir, readFile, copyFile, mkdir, rm, rename } from 'node:fs/promises
 import { join, dirname, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { sendTelegramAlert } from './alert-transport.ts'
+import { checkLeaseFor } from './lease.ts'
 import { createHash } from 'node:crypto'
 import net from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
@@ -353,6 +354,16 @@ export function apply(ctx: Context, config: Config): void {
    */
   const notifyWebReady = async (): Promise<void> => {
     try {
+      // 【生命周期租约 · 2026-09-12 双重重启事故修复】哨兵取租动手期间，唤醒归哨兵——
+      // 守护重复唤醒会让主人收到两条「web 已重启」（22:33 实测两条 [守护] 消息）。
+      const leaseGate = checkLeaseFor(dshHome, 'guardian', Date.now())
+      if (leaseGate.issue !== undefined) {
+        logEvent('生命周期租约读取异常（按空闲处理）: ' + leaseGate.issue)
+      }
+      if (leaseGate.action === 'hold') {
+        logEvent('生命周期租约：' + leaseGate.why + ' ——跳过唤醒（由持租方唤醒，不重复）')
+        return
+      }
       const getter = (ctx as unknown as { get?: (name: string) => unknown }).get
       const waker = typeof getter === 'function' ? getter.call(ctx, 'sessionWaker') as SessionWakerLite | undefined : undefined
       if (waker === undefined || typeof waker.wakeLatestSession !== 'function') {
@@ -375,6 +386,19 @@ export function apply(ctx: Context, config: Config): void {
   const spawnWeb = (workspace: string): Promise<void> =>
     new Promise((resolvePromise) => {
       void (async () => {
+        // 【生命周期租约 · 2026-09-12 双重重启事故修复】哨兵取租动手期间，守护不得再拉一个
+        // web：事故现场 22:33 一次重部署拉起两个实例——多出来的那个绑定端口失败退出
+        // （`web 退出但端口被活 dsh web 占用（PID 23456）——收养接管，跳过拉起`）。
+        // 本闸门覆盖**所有**拉起路径（启动自检/崩溃自愈/心跳保活），一处设卡处处生效。
+        const leaseGate = checkLeaseFor(dshHome, 'guardian', Date.now())
+        if (leaseGate.issue !== undefined) {
+          logEvent('生命周期租约读取异常（按空闲处理）: ' + leaseGate.issue)
+        }
+        if (leaseGate.action === 'hold') {
+          logEvent('生命周期租约：' + leaseGate.why + ' ——收养而非拉起（跳过 spawn）')
+          resolvePromise()
+          return
+        }
         // 【数据健康 gate · 主人 2026-08-28】所有拉起路径前置：storages 损坏 →
         // 从最近健康存档点恢复（存档点联动），再走 preflight。顺序关键：数据损坏会让
         // preflight 试运行失败（fail-closed 拒绝拉起）→ 永远起不来。
