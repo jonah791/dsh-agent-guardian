@@ -122,6 +122,7 @@
 | `judgeTelegramResponse(code, stdout) → {ok, detail}` | `src/alert-transport.ts` | 送达判据：`stdout` 以 `ERR ` 开头 → 失败；非 JSON → 失败；`code !== 0` → 失败；`parsed.ok !== true` → 失败；否则成功（I6）|
 | `sendTelegramAlert(opts) → {ok, channel, detail}` | `src/alert-transport.ts` | 主通道 `node-fetch`（spawn node 子进程 + `NODE_USE_ENV_PROXY=1`）→ 失败则 `curl` 兜底；缺凭据时 `channel:'none'` 且**明确失败**（不静默）|
 | `checkLeaseFor(dshHome, role, nowMs) → LeaseGate & {issue?}` | `src/lease.ts`（副本）| 守护侧**唯一**的让位查询入口；语义主副本在 sentinel 文档 §4.2 |
+| `shouldDeliverWake(nowMs, lastDeliveredAtMs, windowMs?) → boolean` | `src/wake-dedup.ts` | 拉起后唤醒去重判据（窗口缺省 `WAKE_DEDUP_MS = 5000`）。标定依据：成对间隔毫秒级 vs 正常间隔分钟级；**不动 `spawnWeb`**（锁泄漏会让 web 永远起不来=致命，漏一条提醒=非致命）。`lastDeliveredAtMs = 0` 视为从未投递 ⇒ 放行；时钟回拨判 `false`（保守侧）|
 
 ### 5.4 调用点清单 `[MUST]`
 
@@ -133,7 +134,7 @@
 | 崩溃自愈 | `onWebExit` → 5s 后 → `spawnWeb(lastWorkspace)` | 同上 | 快速退出计数在闸门**之前**判定，熔断优先 |
 | 端口释放后重拉 | `onWebExit` → `waitPortFree()` 成功 → `spawnWeb(lastWorkspace)` | 同上 | 等待有界（I5）|
 | 收养轮询自愈 | `ensureExternalTimer` 5s 轮询发现被收养者消失 → `spawnWeb(...)` | 同上 | 收养路径**必须**起轮询，否则崩溃后无人拉起（2026-08-27 修复）|
-| 唤醒 | `spawnWeb` 成功后 → `notifyWebReady()` | **仅租约**（让位则不唤醒）| 唤醒不重复：持租方负责唤醒（2026-09-12）|
+| 唤醒 | `spawnWeb` 成功后 → `notifyWebReady()` | **租约 + 去重窗口**（让位则不唤醒；窗口内跳过）| 唤醒不重复由两道闸门承担：① 持租方负责唤醒（2026-09-12 租约闸门）② 同进程 5s 窗口去重（2026-10-15）——**租约拦不住 guardian vs guardian**（守护自己不取租），实测 `拉起后唤醒已发送` 72 条里 **8 次成对**（≈11%）|
 | 优雅停止 | `SIGINT` / `SIGTERM` → `onSig()` | — | 置 `manualStop`、清轮询、kill 自己的 child 或被收养者 |
 
 **服务消费**：`inject = ['preflight', 'agentRuntime', 'webman']`（硬依赖）；`sessionWaker` 用 `ctx.get` **可选**消费——不能进 `inject`，否则 sentinel 缺席时保活本身会被 Cordis 激活门一起挡住（本末倒置）。

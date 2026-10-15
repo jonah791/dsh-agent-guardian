@@ -16,6 +16,7 @@ import { join, dirname, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { sendTelegramAlert } from './alert-transport.ts'
 import { checkLeaseFor } from './lease.ts'
+import { shouldDeliverWake } from './wake-dedup.ts'
 import { createHash } from 'node:crypto'
 import net from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
@@ -356,8 +357,29 @@ export function apply(ctx: Context, config: Config): void {
    * 用 `ctx.get` 取可选服务——**不能加进 inject**：inject 是 cordis 的激活门，
    * sentinel 缺席时若被 gate 住，保活本身也停了（本末倒置）。
    */
+  /**
+   * 拉起后唤醒去重窗口（2026-10-15 实测驱动）。
+   *
+   * 事故形状：`spawnWeb` 全程无并发互斥，两次并发调用会各自走完「查租约 → preflight →
+   * 端口防线 → spawn」——都在端口还空着时通过第 ④ 步、都 spawn 成功 ⇒ `notifyWebReady`
+   * 被调两次。租约闸门只拦得住 guardian vs sentinel（它自己不取租），**拦不住
+   * guardian vs guardian**。线上现算：`拉起后唤醒已发送` 72 条里 **8 次成对**
+   * （≈11%），最近 `2026-10-15T02:57:06Z`（两条间隔 11ms）。
+   *
+   * 标定依据：成对的两条间隔是**毫秒级**（并发指纹），而正常两次拉起相隔 ≥ 分钟级
+   * ⇒ 5s 窗口有巨大余量。**不动 spawnWeb**：锁泄漏会让 web 永远起不来（致命），
+   * 而去重最坏只漏一条提醒（非致命）——两侧代价不对称时取严在「不碰生命线」这一侧。
+   */
+  let lastWakeAtMs = 0
+
   const notifyWebReady = async (): Promise<void> => {
     try {
+      const nowMs = Date.now()
+      if (!shouldDeliverWake(nowMs, lastWakeAtMs)) {
+        logEvent('拉起后唤醒去重（' + String(nowMs - lastWakeAtMs) + 'ms 内已发过，跳过）')
+        return
+      }
+      lastWakeAtMs = nowMs
       // 【生命周期租约 · 2026-09-12 双重重启事故修复】哨兵取租动手期间，唤醒归哨兵——
       // 守护重复唤醒会让主人收到两条「web 已重启」（22:33 实测两条 [守护] 消息）。
       const leaseGate = checkLeaseFor(dshHome, 'guardian', Date.now())
